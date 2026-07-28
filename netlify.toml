@@ -1,0 +1,16 @@
+# Configuración de compilación para Netlify.
+# Si arrastra la carpeta "dist" ya compilada, Netlify no usa esto.
+# Si conecta un repositorio de GitHub, Netlify lee estos valores.
+
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  NODE_VERSION = "20"
+
+# Redirige cualquier ruta a index.html (aplicación de una sola página).
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
