@@ -30,8 +30,22 @@ const ESCUELAS = ["ECACEN", "ECISA", "ECBTI", "ECJP", "ECAPMA", "ECSAH", "ECEDU"
 const UMBRAL_MATRICULAS = 9; // 9 o más matrículas = alerta de permanencia
 
 /* ---------------------- utilidades ---------------------- */
+/* Decodifica las entidades HTML más comunes en acentos, por si el lector deja
+   "C&oacute;digo" sin convertir a "Código". Así la detección de columnas funciona
+   con o sin decodificación previa. */
+function decodificarHTML(s) {
+  if (typeof s !== "string") return s;
+  if (!s.includes("&")) return s;
+  return s
+    .replace(/&aacute;/gi, "á").replace(/&eacute;/gi, "é").replace(/&iacute;/gi, "í")
+    .replace(/&oacute;/gi, "ó").replace(/&uacute;/gi, "ú").replace(/&ntilde;/gi, "ñ")
+    .replace(/&Aacute;/g, "Á").replace(/&Eacute;/g, "É").replace(/&Iacute;/g, "Í")
+    .replace(/&Oacute;/g, "Ó").replace(/&Uacute;/g, "Ú").replace(/&Ntilde;/g, "Ñ")
+    .replace(/&amp;/gi, "&").replace(/&nbsp;/gi, " ");
+}
+
 const sinTildes = (s) =>
-  String(s ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toUpperCase().trim();
+  String(decodificarHTML(s ?? "")).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toUpperCase().trim();
 
 const fmt = (v) =>
   v === null || v === undefined || v === "" ? "—" : Number(v).toLocaleString("es-CO");
@@ -69,23 +83,21 @@ function normalizarEscuela(valor) {
 /* Busca la fila de encabezados: la primera fila (en las primeras 20) que
    contenga una celda tipo "documento". Devuelve su índice y los encabezados. */
 /* Algunos reportes traen un encabezado de dos niveles: una fila superior con
-   el período repetido ("2026 I PERIODO 16-01" en cada celda) y debajo los
-   nombres reales de columna. Si detecta esa fila superior repetitiva sin datos
-   de documento, la descarta para quedarse con los encabezados verdaderos. */
+   el período (a veces en una sola celda con colspan que abarca todo, a veces
+   repetido en cada celda) y debajo los nombres reales de columna. Si la fila 1
+   contiene los encabezados verdaderos (código/documento/nombres) y la fila 0 no,
+   descarta la fila 0. */
 function aplanarEncabezadoDoble(filas) {
   if (filas.length < 2) return filas;
-  const fila0 = filas[0] || [];
-  const noVacias = fila0.filter((c) => c !== null && c !== undefined && c !== "");
-  if (noVacias.length < 2) return filas;
-  // ¿todas las celdas no vacías de la fila 0 son el mismo texto? (período repetido)
-  const primeras = noVacias.map((c) => sinTildes(c));
-  const todasIguales = primeras.every((c) => c === primeras[0]);
-  // ¿la fila 1 parece encabezado real? (contiene "codigo", "documento" o "nombres")
-  const fila1 = (filas[1] || []).map((c) => sinTildes(c));
-  const fila1EsEncabezado = fila1.some((c) => c.includes("CODIGO") || c.includes("DOCUMENTO") || c.includes("NOMBRES"));
-  if (todasIguales && fila1EsEncabezado) {
-    return filas.slice(1); // descarta la fila superior repetida
-  }
+  const filaEsEncabezado = (fila) =>
+    (fila || []).some((c) => {
+      const t = sinTildes(c);
+      return t.includes("CODIGO") || t.includes("DOCUMENTO") || t === "CEDULA" || (t.includes("NOMBRES") && (fila || []).some((x) => sinTildes(x).includes("APELLIDOS") || sinTildes(x).includes("TELEFONO")));
+    });
+  const fila0Enc = filaEsEncabezado(filas[0]);
+  const fila1Enc = filaEsEncabezado(filas[1]);
+  // Si la fila 0 NO es encabezado pero la fila 1 SÍ, la fila 0 es un título/período: descártala.
+  if (!fila0Enc && fila1Enc) return filas.slice(1);
   return filas;
 }
 
@@ -141,7 +153,7 @@ async function leerBase(file) {
     if (!filas.length) continue;
     filas = aplanarEncabezadoDoble(filas);
     const hIdx = detectarEncabezado(filas);
-    const enc = (filas[hIdx] || []).map((c) => (c === null || c === undefined ? "" : String(c).trim()));
+    const enc = (filas[hIdx] || []).map((c) => decodificarHTML(c === null || c === undefined ? "" : String(c).trim()));
     const colDoc = indiceCol(enc, PRUEBAS_DOC);
     if (colDoc < 0) continue;
     const registros = [];
