@@ -68,10 +68,31 @@ function normalizarEscuela(valor) {
 
 /* Busca la fila de encabezados: la primera fila (en las primeras 20) que
    contenga una celda tipo "documento". Devuelve su índice y los encabezados. */
+/* Algunos reportes traen un encabezado de dos niveles: una fila superior con
+   el período repetido ("2026 I PERIODO 16-01" en cada celda) y debajo los
+   nombres reales de columna. Si detecta esa fila superior repetitiva sin datos
+   de documento, la descarta para quedarse con los encabezados verdaderos. */
+function aplanarEncabezadoDoble(filas) {
+  if (filas.length < 2) return filas;
+  const fila0 = filas[0] || [];
+  const noVacias = fila0.filter((c) => c !== null && c !== undefined && c !== "");
+  if (noVacias.length < 2) return filas;
+  // ¿todas las celdas no vacías de la fila 0 son el mismo texto? (período repetido)
+  const primeras = noVacias.map((c) => sinTildes(c));
+  const todasIguales = primeras.every((c) => c === primeras[0]);
+  // ¿la fila 1 parece encabezado real? (contiene "codigo", "documento" o "nombres")
+  const fila1 = (filas[1] || []).map((c) => sinTildes(c));
+  const fila1EsEncabezado = fila1.some((c) => c.includes("CODIGO") || c.includes("DOCUMENTO") || c.includes("NOMBRES"));
+  if (todasIguales && fila1EsEncabezado) {
+    return filas.slice(1); // descarta la fila superior repetida
+  }
+  return filas;
+}
+
 function detectarEncabezado(filas) {
   for (let i = 0; i < Math.min(filas.length, 20); i++) {
     const fila = (filas[i] || []).map((c) => sinTildes(c));
-    if (fila.some((c) => c.includes("DOCUMENTO") || c === "DOC" || c === "IDENTIFICACION" || c === "CEDULA")) {
+    if (fila.some((c) => c.includes("DOCUMENTO") || c === "DOC" || c === "IDENTIFICACION" || c === "CEDULA" || c === "CODIGO")) {
       return i;
     }
   }
@@ -91,22 +112,37 @@ function indiceCol(enc, pruebas) {
   return -1;
 }
 
+/* Pruebas para reconocer la columna de documento. Incluye "Código", que es
+   como el SII llama al documento en sus reportes. */
+const PRUEBAS_DOC = [
+  (c) => c.includes("DOCUMENTO"),
+  (c) => c === "DOC" || c === "IDENTIFICACION" || c === "CEDULA" || c === "ID",
+  (c) => c === "CODIGO" || c === "COD",
+];
+
+/* Detecta si el contenido del archivo es en realidad HTML (algunos sistemas,
+   como el SII, exportan una tabla web con extensión .xls). */
+function pareceHTML(buf) {
+  const muestra = new TextDecoder("utf-8").decode(new Uint8Array(buf).slice(0, 2000)).toLowerCase();
+  return muestra.includes("<table") || muestra.includes("<html") || muestra.includes("<tr");
+}
+
 /* Lee un archivo y devuelve un objeto base: encabezados + filas de registros,
    cada uno con su documento normalizado y un mapa de sus columnas. */
 async function leerBase(file) {
   const buf = await file.arrayBuffer();
-  const wb = XLSX.read(buf, { type: "array", cellDates: true });
+  const wb = pareceHTML(buf)
+    ? XLSX.read(new TextDecoder("utf-8").decode(new Uint8Array(buf)), { type: "string", cellDates: true })
+    : XLSX.read(buf, { type: "array", cellDates: true });
   const resultados = [];
   for (const nombreHoja of wb.SheetNames) {
     const hoja = wb.Sheets[nombreHoja];
-    const filas = XLSX.utils.sheet_to_json(hoja, { header: 1, defval: null, raw: true });
+    let filas = XLSX.utils.sheet_to_json(hoja, { header: 1, defval: null, raw: true });
     if (!filas.length) continue;
+    filas = aplanarEncabezadoDoble(filas);
     const hIdx = detectarEncabezado(filas);
     const enc = (filas[hIdx] || []).map((c) => (c === null || c === undefined ? "" : String(c).trim()));
-    const colDoc = indiceCol(enc, [
-      (c) => c.includes("DOCUMENTO"),
-      (c) => c === "DOC" || c === "IDENTIFICACION" || c === "CEDULA" || c === "ID",
-    ]);
+    const colDoc = indiceCol(enc, PRUEBAS_DOC);
     if (colDoc < 0) continue;
     const registros = [];
     for (let i = hIdx + 1; i < filas.length; i++) {
@@ -295,9 +331,10 @@ function VistaCargar({ bases, setBases, setVista }) {
     <>
       <Tarjeta titulo="Cargar bases de datos (hasta 3)">
         <p style={{ fontSize: 14, color: C.gris, marginTop: 0 }}>
-          Suba de una a tres bases en Excel o CSV, tal como las descarga del sistema. La aplicación detecta sola la fila de
-          encabezados y la columna de documento, que es la llave para cruzar. Póngale a cada base una etiqueta clara (por
-          ejemplo «Inscritos PIC», «Matriculados», «Continúan 16-01»); esas etiquetas se usan en los cruces. Todo el
+          Suba de una a tres bases en Excel o CSV, tal como las descarga del sistema (incluye los reportes «.xls» del SII, que
+          en realidad son tablas web). La aplicación detecta sola la fila de encabezados y la columna de documento (o
+          «Código»), que es la llave para cruzar. Póngale a cada base una etiqueta clara (por
+          ejemplo «Matriculados 16-01», «Matriculados 16-04»); esas etiquetas se usan en los cruces. Todo el
           procesamiento ocurre en su navegador: los datos no se envían a ningún servidor.
         </p>
         {bases.length < 3 && (
@@ -356,6 +393,7 @@ const CATEGORIAS = [
 
 function VistaCruce({ bases }) {
   const [catId, setCatId] = useState("AyB");
+  const [modo, setModo] = useState("contacto"); // resumen | contacto | completo
   const cat = CATEGORIAS.find((c) => c.id === catId);
   const nBases = bases.length;
 
@@ -375,33 +413,98 @@ function VistaCruce({ bases }) {
     else if (catId === "AyBnoC") docs = [...setA].filter((d) => setB.has(d) && !setC.has(d));
     else if (catId === "AnoByC") docs = [...setA].filter((d) => !setB.has(d) && !setC.has(d));
 
-    // arma filas combinando datos de las bases donde aparece cada documento
-    const filas = docs.map((d) => {
-      const rA = A && A.get(d);
-      const rB = B && B.get(d);
-      const rC = Cc && Cc.get(d);
-      const base = rA || rB || rC || {};
-      const nombre = base["NOMBRES"] || base["Nombres"] || base["NOMBRE"] || "";
-      const esc = base["ESCUELA"] || base["Escuela"] || "";
-      const prog = base["PROGRAMA"] || base["Programa"] || "";
-      const centro = base["CENTRO"] || base["Centro"] || "";
-      return {
-        Documento: d,
-        Nombres: nombre,
-        Escuela: esc,
-        Programa: prog,
-        Centro: centro,
-        [`En ${bases[0].etiqueta}`]: rA ? "Sí" : "No",
-        ...(bases[1] ? { [`En ${bases[1].etiqueta}`]: rB ? "Sí" : "No" } : {}),
-        ...(bases[2] ? { [`En ${bases[2].etiqueta}`]: rC ? "Sí" : "No" } : {}),
-      };
-    });
-    filas.sort((a, b) => String(a.Nombres).localeCompare(String(b.Nombres)));
-    return filas;
-  }, [idxs, catId, cat, nBases, bases]);
+    const indices = [A, B, Cc];
 
-  const columnas = resultado && resultado.length ? Object.keys(resultado[0]) : [];
-  const nombreArchivo = `cruce_${catId}_${new Date().toISOString().slice(0, 10)}`;
+    // Toma el primer valor no vacío de un campo, buscándolo (sin tildes ni
+    // mayúsculas) en los registros del estudiante en las tres bases.
+    const primerValor = (regs, nombres) => {
+      const claves = nombres.map(sinTildes);
+      for (const r of regs) {
+        if (!r) continue;
+        for (const k of Object.keys(r)) {
+          if (claves.includes(sinTildes(k))) {
+            const v = r[k];
+            if (v !== null && v !== undefined && String(v).trim() !== "") return v;
+          }
+        }
+      }
+      return "";
+    };
+
+    const filas = docs.map((d) => {
+      const regs = indices.map((idx) => (idx ? idx.get(d) : null));
+      // Campos clave de identidad y contacto, tomados de donde estén.
+      const fila = {
+        Documento: d,
+        Nombres: primerValor(regs, ["NOMBRES", "NOMBRE"]),
+        Apellidos: primerValor(regs, ["APELLIDOS", "APELLIDO"]),
+        Telefono: primerValor(regs, ["TELEFONO", "CELULAR", "TELEFONO CELULAR"]),
+        "Telefono alterno": primerValor(regs, ["TELEFONO ALTERNATIVO", "TELEFONO ALTERNO", "TELEFONO 2"]),
+        Correo: primerValor(regs, ["CORREO", "CORREO CONTACTO", "EMAIL", "CORREO ELECTRONICO"]),
+        "Correo alterno": primerValor(regs, ["CORREO ALTERNATIVO", "CORREO ALTERNO"]),
+        "Correo institucional": primerValor(regs, ["CORREO INSTITUCIONAL", "EMAIL INSTITUCIONAL"]),
+        Escuela: primerValor(regs, ["ESCUELA"]),
+        Programa: primerValor(regs, ["PROGRAMA"]),
+        Centro: primerValor(regs, ["CENTRO"]),
+        "Ciudad residencia": primerValor(regs, ["CIUDAD DE RESIDENCIA", "CIUDAD"]),
+        "Departamento residencia": primerValor(regs, ["DEPARTAMENTO DE RESIDENCIA", "DEPARTAMENTO"]),
+        Condicion: primerValor(regs, ["CONDICION", "ESTADO", "TIPO ESTUDIANTE", "TIPO"]),
+      };
+
+      // Marca de presencia en cada base.
+      const presencia = {};
+      bases.forEach((b, i) => { presencia[`En ${b.etiqueta}`] = regs[i] ? "Sí" : "No"; });
+
+      // Modo completo: además vuelca TODAS las columnas de cada base con el
+      // prefijo de su letra, para no perder ningún dato.
+      const completo = {};
+      if (modo === "completo") {
+        regs.forEach((r, i) => {
+          if (!r) return;
+          const letra = String.fromCharCode(65 + i);
+          for (const k of Object.keys(r)) {
+            if (k === "__doc") continue;
+            completo[`[${letra}] ${k}`] = r[k];
+          }
+        });
+      }
+
+      return { fila, presencia, completo };
+    });
+
+    filas.sort((a, b) => String(a.fila.Nombres).localeCompare(String(b.fila.Nombres)));
+
+    // Ensambla las columnas según el modo elegido.
+    const CLAVE = ["Documento", "Nombres", "Apellidos", "Escuela", "Programa", "Centro"];
+    const CONTACTO = ["Telefono", "Telefono alterno", "Correo", "Correo alterno", "Correo institucional", "Ciudad residencia", "Departamento residencia", "Condicion"];
+    return filas.map(({ fila, presencia, completo }) => {
+      if (modo === "resumen") {
+        const o = {};
+        for (const c of CLAVE) o[c] = fila[c];
+        return { ...o, ...presencia };
+      }
+      if (modo === "contacto") {
+        const o = {};
+        for (const c of [...CLAVE.slice(0, 3), ...CONTACTO, ...CLAVE.slice(3)]) o[c] = fila[c];
+        return { ...o, ...presencia };
+      }
+      // completo
+      return { ...fila, ...presencia, ...completo };
+    });
+  }, [idxs, catId, cat, nBases, bases, modo]);
+
+  // Columnas = unión de las claves de todas las filas (en modo completo cada
+  // estudiante puede traer columnas distintas según en qué bases aparezca).
+  const columnas = useMemo(() => {
+    if (!resultado || !resultado.length) return [];
+    const set = [];
+    const vistos = new Set();
+    for (const f of resultado) for (const k of Object.keys(f)) {
+      if (!vistos.has(k)) { vistos.add(k); set.push(k); }
+    }
+    return set;
+  }, [resultado]);
+  const nombreArchivo = `cruce_${catId}_${modo}_${new Date().toISOString().slice(0, 10)}`;
 
   const etiquetaCat = (txt) => txt
     .replace(/\bA\b/g, bases[0] ? bases[0].etiqueta : "A")
@@ -431,6 +534,22 @@ function VistaCruce({ bases }) {
           titulo={`${fmt(resultado.length)} estudiantes — ${etiquetaCat(cat.nom)}`}
           extra={<BotonesDescarga nombre={nombreArchivo} columnas={columnas} filas={resultado} />}
         >
+          <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", marginBottom: 12 }}>
+            <span style={{ fontSize: 12.5, fontWeight: 600, color: C.gris }}>Nivel de detalle:</span>
+            <div style={{ display: "inline-flex", border: `1px solid ${C.borde}`, borderRadius: 8, overflow: "hidden" }}>
+              {[["resumen", "Resumen"], ["contacto", "Con datos de contacto"], ["completo", "Todos los campos"]].map(([id, tx]) => (
+                <button key={id} className="btn" onClick={() => setModo(id)}
+                  style={{ borderRadius: 0, background: modo === id ? C.azul : "#fff", color: modo === id ? "#fff" : C.tinta, fontWeight: 600, fontSize: 12.5 }}>
+                  {tx}
+                </button>
+              ))}
+            </div>
+          </div>
+          <p style={{ fontSize: 12.5, color: C.gris, marginTop: 0, marginBottom: 12 }}>
+            {modo === "resumen" && "Solo identificación básica. Útil para un vistazo rápido."}
+            {modo === "contacto" && "Incluye teléfonos, correos y ciudad para poder contactar al estudiante. Los datos se toman de la base que los tenga (por ejemplo, teléfono y correo suelen venir de la base de inscritos)."}
+            {modo === "completo" && "Vuelca TODAS las columnas de las tres bases, cada una con el prefijo de su letra ([A], [B], [C]). La tabla se ve ancha; la descarga trae absolutamente todo."}
+          </p>
           {resultado.length === 0 ? (
             <p style={{ color: C.gris, fontSize: 14 }}>Ningún estudiante cumple esta condición con las bases cargadas.</p>
           ) : (
